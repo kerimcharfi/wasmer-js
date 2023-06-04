@@ -3,6 +3,8 @@ use crate::fs::MemFS;
 use std::io::{Read, Write};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasmer::Extern;
+use wasmer::Memory;
 use wasmer::{Imports, Instance, Module, Store};
 use wasmer_wasi::Pipe;
 use wasmer_wasi::{WasiError, WasiFunctionEnv, WasiState};
@@ -26,6 +28,9 @@ export type WasiConfig = {
 extern "C" {
     #[wasm_bindgen(typescript_type = "WasiConfig")]
     pub type WasiConfig;
+
+    #[wasm_bindgen(js_namespace = console)]
+    fn log(s: &str);
 }
 
 #[wasm_bindgen]
@@ -184,11 +189,14 @@ impl WASI {
         module_or_instance: JsValue,
         imports: Option<js_sys::Object>,
     ) -> Result<js_sys::WebAssembly::Instance, JsValue> {
+        let mut memory: Option<Memory> = None;
+
         let instance = if module_or_instance.has_type::<js_sys::WebAssembly::Module>() {
             let js_module: js_sys::WebAssembly::Module = module_or_instance.unchecked_into();
             let module: Module = js_module.into();
             let import_object = self.get_wasi_imports(&module)?;
-            let imports = if let Some(base_imports) = imports {
+            let imports: Imports = if let Some(base_imports) = imports {
+                // let get_memory = js_sys::Reflect::get(&base_imports, &JsValue::from_str("memory"));
                 let mut imports =
                     Imports::new_from_js_object(&mut self.store, &module, base_imports).map_err(
                         |e| js_sys::Error::new(&format!("Failed to get user imports: {}", e)),
@@ -198,18 +206,41 @@ impl WASI {
             } else {
                 import_object
             };
-
+            match imports.get_export("env", "memory") {
+                Some(_memory) => match _memory {
+                    Extern::Memory(_memory) => memory = Some(_memory),
+                    _ => log(&format!("Did not match Memory: {}", 5)),
+                }
+                _ => log("no imported memory found"),
+            }
             let instance = Instance::new(&mut self.store, &module, &imports)
                 .map_err(|e| js_sys::Error::new(&format!("Failed to instantiate WASI: {}`", e)))?;
             self.module = Some(module);
             instance
         } else if module_or_instance.has_type::<js_sys::WebAssembly::Instance>() {
+            log("got instance");
             if let Some(instance) = &self.instance {
                 // We completely skip the set instance step
                 return Ok(instance.raw(&self.store).clone());
             }
+
             let module = self.module.as_ref().ok_or(js_sys::Error::new("When providing an instance, the `wasi.getImports` must be called with the module first"))?;
             let js_instance: js_sys::WebAssembly::Instance = module_or_instance.unchecked_into();
+
+            if let Some(base_imports) = imports {
+                // let get_memory = js_sys::Reflect::get(&base_imports, &JsValue::from_str("memory"));
+                let mut imports =
+                    Imports::new_from_js_object(&mut self.store, &module, base_imports).map_err(
+                        |e| js_sys::Error::new(&format!("Failed to get user imports: {}", e)),
+                    )?;
+                    match imports.get_export("env", "memory") {
+                        Some(_memory) => match _memory {
+                            Extern::Memory(_memory) => memory = Some(_memory),
+                            _ => log(&format!("Did not match Memory: {}", 5)),
+                        }
+                        _ => log("no imported memory found"),
+                    }
+            } 
 
             Instance::from_module_and_instance(&mut self.store, module, js_instance).map_err(
                 |e| js_sys::Error::new(&format!("Can't get the Wasmer Instance: {:?}", e)),
@@ -220,9 +251,15 @@ impl WASI {
             );
         };
 
+        
+        match memory {
+            Some(_) => (), 
+            None    => memory = Some(instance.exports.get_memory("memory").unwrap().clone()),
+        }
+
         self.wasi_env
             .data_mut(&mut self.store)
-            .set_memory(instance.exports.get_memory("memory").unwrap().clone());
+            .set_memory(memory.unwrap());
 
         let raw_instance = instance.raw(&self.store).clone();
         self.instance = Some(instance);
